@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "inflow-shield-lib"
+version = "1.0.0"
+description = "Lightweight AI guardrails library — PromptInjection, Toxicity, Secrets, Vault"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "transformers>=4.38.0",
+    "torch>=2.2.0",
+    "huggingface-hub==0.31.0",
+    "tokenizers>=0.15.0",
+    "presidio-analyzer>=2.2.354",
+    "presidio-anonymizer>=2.2.354",
+    "spacy>=3.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "twine", "build"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["inflow_shield_lib*"]
