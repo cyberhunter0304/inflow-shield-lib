@@ -3,6 +3,8 @@ from setuptools import setup, find_packages
 setup(
     name="inflow-shield-lib",
     version="1.0.0",
+    author="Jonathan",
+    author_email="jonathanv@inextlabs.com",
     description="Lightweight AI guardrails — PromptInjection, Toxicity, Secrets, Vault",
     packages=find_packages(),
     python_requires=">=3.10",
