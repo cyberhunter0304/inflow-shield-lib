@@ -9,6 +9,9 @@ description = "Lightweight AI guardrails library — PromptInjection, Toxicity, 
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+authors = [
+    { name = "Jonathan", email = "jonathanv@inextlabs.com" }
+]
 
 dependencies = [
     "transformers>=4.38.0",
