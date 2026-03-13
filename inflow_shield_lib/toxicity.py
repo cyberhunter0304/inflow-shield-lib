@@ -2,20 +2,16 @@
 inflow_shield_lib.toxicity
 ---------------------------
 Toxicity scanner using unitary's unbiased-toxic-roberta model.
-Direct transformers call — no llm_guard wrapper.
 
-Model: unitary/unbiased-toxic-roberta
-Same model, same logic, same scan() interface as llm_guard.Toxicity.
+GPU path (default on CUDA):
+    ONNX Runtime with CUDAExecutionProvider.
+    padding="max_length" ensures fixed [1,512] input shapes for CUDA graphs.
 
-GPU Support:
-    Automatically uses CUDA GPU if available, falls back to CPU.
-    Set INFLOW_DEVICE=cpu to force CPU even if GPU is present.
+CPU fallback:
+    Standard HuggingFace pipeline.
 
-GPU Extras (vs original):
-    ✅ torch.compile(pipeline.model) — fuses RoBERTa kernels at first warmup.
-       Uses mode="reduce-overhead" (safe: padding="max_length" gives fixed shapes,
-       allowing CUDA graph capture for maximum throughput).
-       Set INFLOW_NO_COMPILE=1 to disable.
+Set INFLOW_DEVICE=cpu to force CPU.
+Set INFLOW_NO_ORT=1  to skip ONNX Runtime.
 """
 import logging
 import os
@@ -27,53 +23,35 @@ logger = logging.getLogger(__name__)
 _MODEL_PATH = "unitary/unbiased-toxic-roberta"
 
 _TOXIC_LABELS = [
-    "toxicity",
-    "severe_toxicity",
-    "obscene",
-    "threat",
-    "insult",
-    "identity_attack",
-    "sexual_explicit",
+    "toxicity", "severe_toxicity", "obscene",
+    "threat", "insult", "identity_attack", "sexual_explicit",
 ]
 
 _pipeline      = None
 _pipeline_lock = threading.Lock()
 
 
-def _resolve_device() -> int | str:
+def _resolve_device() -> int:
     env = os.getenv("INFLOW_DEVICE", "auto").lower()
     if env == "cpu":
-        logger.info("[Toxicity] Device forced to CPU via INFLOW_DEVICE env var")
+        logger.info("[Toxicity] Device forced to CPU via INFLOW_DEVICE")
         return -1
     if env == "cuda":
         import torch
         if not torch.cuda.is_available():
             raise RuntimeError("INFLOW_DEVICE=cuda but no CUDA GPU found")
-        logger.info("[Toxicity] Device forced to CUDA via INFLOW_DEVICE env var")
         return 0
     try:
         import torch
         if torch.cuda.is_available():
-            logger.info(f"[Toxicity] GPU detected: {torch.cuda.get_device_name(0)} — using CUDA")
+            logger.info(f"[Toxicity] GPU detected: {torch.cuda.get_device_name(0)}")
             return 0
-        else:
-            logger.info("[Toxicity] No GPU detected — using CPU")
-            return -1
+        return -1
     except ImportError:
         return -1
 
 
 def _get_pipeline():
-    """
-    Load the transformers pipeline once and cache it.
-    Applies torch.compile() to pipeline.model on GPU.
-
-    Toxicity uses padding="max_length" → all inputs are shape [batch, 512].
-    Fixed shapes allow mode="reduce-overhead" which uses CUDA graph capture
-    for maximum throughput (better than "default" which recompiles per shape).
-
-    Thread-safe via lock.
-    """
     global _pipeline
     if _pipeline is not None:
         return _pipeline
@@ -82,72 +60,77 @@ def _get_pipeline():
         if _pipeline is not None:
             return _pipeline
 
-        device       = _resolve_device()
+        device  = _resolve_device()
+        use_ort = device == 0 and not os.getenv("INFLOW_NO_ORT")
+
+        if use_ort:
+            try:
+                from optimum.onnxruntime import ORTModelForSequenceClassification
+                from transformers import AutoTokenizer, pipeline as hf_pipeline
+
+                logger.info("[Toxicity] Loading via ONNX Runtime (CUDAExecutionProvider)...")
+                model     = ORTModelForSequenceClassification.from_pretrained(
+                    _MODEL_PATH,
+                    export=True,
+                    provider="CUDAExecutionProvider",
+                )
+                tokenizer = AutoTokenizer.from_pretrained(_MODEL_PATH)
+                _pipeline = hf_pipeline(
+                    task="text-classification",
+                    model=model,
+                    tokenizer=tokenizer,
+                    device="cuda:0",
+                    padding="max_length",
+                    top_k=None,
+                    function_to_apply="sigmoid",
+                    return_token_type_ids=False,
+                    max_length=512,
+                    truncation=True,
+                )
+                logger.info("[Toxicity] ✅ ONNX Runtime loaded (CUDAExecutionProvider)")
+                return _pipeline
+            except Exception as e:
+                logger.warning(f"[Toxicity] ONNX Runtime failed ({e}) — falling back to PyTorch")
+
+        # ── PyTorch fallback ─────────────────────────────────────────────────
+        from transformers import pipeline as hf_pipeline
+        import torch
+
+        torch_dtype  = torch.float16 if device == 0 else torch.float32
         device_label = "GPU:0" if device == 0 else "CPU"
-        logger.info(f"[Toxicity] Loading model: {_MODEL_PATH} on {device_label}")
+        logger.info(f"[Toxicity] Loading PyTorch pipeline on {device_label} (dtype={torch_dtype})")
 
-        try:
-            from transformers import pipeline as hf_pipeline
-            import torch
+        _pipeline = hf_pipeline(
+            task="text-classification",
+            model=_MODEL_PATH,
+            device=device,
+            torch_dtype=torch_dtype,
+            padding="max_length",
+            top_k=None,
+            function_to_apply="sigmoid",
+            return_token_type_ids=False,
+            max_length=512,
+            truncation=True,
+        )
 
-            torch_dtype = torch.float16 if device == 0 else torch.float32
+        if device == 0 and not os.getenv("INFLOW_NO_COMPILE") and hasattr(torch, "compile"):
+            try:
+                _pipeline.model = torch.compile(_pipeline.model, mode="reduce-overhead", fullgraph=False)
+                logger.info("[Toxicity] ✅ torch.compile applied (reduce-overhead, CUDA graphs)")
+            except Exception as e:
+                logger.warning(f"[Toxicity] torch.compile skipped: {e}")
 
-            _pipeline = hf_pipeline(
-                task="text-classification",
-                model=_MODEL_PATH,
-                device=device,
-                torch_dtype=torch_dtype,
-                padding="max_length",
-                top_k=None,
-                function_to_apply="sigmoid",
-                return_token_type_ids=False,
-                max_length=512,
-                truncation=True,
-            )
-            logger.info(f"[Toxicity] ✅ Model loaded on {device_label} (dtype={torch_dtype})")
-
-            # ── torch.compile — fuse RoBERTa kernels with CUDA graph capture ─
-            # mode="reduce-overhead": padding="max_length" guarantees fixed input
-            # shape [1, 512], so CUDA graphs can be captured → best throughput.
-            # Disable with: INFLOW_NO_COMPILE=1
-            if device == 0 and not os.getenv("INFLOW_NO_COMPILE"):
-                if hasattr(torch, "compile"):
-                    try:
-                        _pipeline.model = torch.compile(
-                            _pipeline.model,
-                            mode="reduce-overhead",
-                            fullgraph=False,
-                        )
-                        logger.info("[Toxicity] ✅ torch.compile applied (mode=reduce-overhead, CUDA graphs)")
-                    except Exception as e:
-                        logger.warning(f"[Toxicity] torch.compile skipped: {e}")
-                else:
-                    logger.info("[Toxicity] torch.compile not available (PyTorch < 2.0)")
-
-        except Exception as e:
-            logger.error(f"[Toxicity] Failed to load model: {e}")
-            raise
-
+        logger.info(f"[Toxicity] ✅ PyTorch pipeline ready on {device_label}")
     return _pipeline
 
 
 class Toxicity:
     """
     Detects toxic content using unitary's unbiased-toxic-roberta model.
+    GPU: ONNX Runtime (default). CPU fallback: HuggingFace pipeline.
 
-    Drop-in replacement for llm_guard.input_scanners.Toxicity.
-    Same scan() interface: returns (sanitized_prompt, is_valid, risk_score)
-
-    GPU acceleration is automatic when CUDA is available.
-    torch.compile() is applied automatically on GPU for maximum throughput.
-
-    To use a specific CUDA stream (for parallel GPU execution with other scanners),
-    set the stream context BEFORE calling scan():
-        with torch.cuda.stream(my_stream):
-            _, is_valid, score = scanner.scan(prompt)
-
-    Force CPU:         INFLOW_DEVICE=cpu
-    Disable compile:   INFLOW_NO_COMPILE=1
+    Force CPU:    INFLOW_DEVICE=cpu
+    Skip ORT:     INFLOW_NO_ORT=1
     """
 
     def __init__(self, *, threshold: float = 0.5):
@@ -155,24 +138,12 @@ class Toxicity:
         _get_pipeline()
 
     def scan(self, prompt: str) -> tuple[str, bool, float]:
-        """
-        Scan prompt for toxic content.
-
-        Returns:
-            (prompt, is_valid, risk_score)
-            - is_valid=True  → no toxicity detected
-            - is_valid=False → toxicity detected, block this prompt
-            - risk_score     → 0.0 to 1.0 normalized score
-
-        GPU stream note: wrap this call in torch.cuda.stream(stream)
-        from the caller for parallel execution alongside other scanners.
-        """
         if not prompt or prompt.strip() == "":
             return prompt, True, -1.0
 
         try:
-            pipe         = _get_pipeline()
-            results_all  = pipe([prompt])
+            pipe        = _get_pipeline()
+            results_all = pipe([prompt])
 
             highest_score = 0.0
             toxic_hits    = []
