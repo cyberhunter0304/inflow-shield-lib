@@ -6,8 +6,13 @@ Direct transformers call — no llm_guard wrapper.
 
 Model: protectai/deberta-v3-base-prompt-injection-v2
 Same model, same logic, same scan() interface as llm_guard.PromptInjection.
+
+GPU Support:
+    Automatically uses CUDA GPU if available, falls back to CPU.
+    Set INFLOW_DEVICE=cpu to force CPU even if GPU is present.
 """
 import logging
+import os
 import threading
 from typing import Optional
 from .utils import calculate_risk_score
@@ -25,6 +30,37 @@ _pipeline = None
 _pipeline_lock = threading.Lock()
 
 
+def _resolve_device() -> int | str:
+    """
+    Resolve which device to run inference on.
+    - INFLOW_DEVICE=cpu  → force CPU
+    - INFLOW_DEVICE=cuda → force GPU (raises if not available)
+    - default            → GPU if available, else CPU
+    """
+    env = os.getenv("INFLOW_DEVICE", "auto").lower()
+    if env == "cpu":
+        logger.info("[PromptInjection] Device forced to CPU via INFLOW_DEVICE env var")
+        return -1  # transformers uses -1 for CPU
+    if env == "cuda":
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("INFLOW_DEVICE=cuda but no CUDA GPU found")
+        logger.info("[PromptInjection] Device forced to CUDA via INFLOW_DEVICE env var")
+        return 0
+    # Auto-detect
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            logger.info(f"[PromptInjection] GPU detected: {gpu_name} — using CUDA")
+            return 0  # First GPU
+        else:
+            logger.info("[PromptInjection] No GPU detected — using CPU")
+            return -1
+    except ImportError:
+        return -1
+
+
 def _get_pipeline():
     """
     Load the transformers pipeline once and cache it.
@@ -38,17 +74,27 @@ def _get_pipeline():
         if _pipeline is not None:  # Double-check after acquiring lock
             return _pipeline
 
-        logger.info(f"[PromptInjection] Loading model: {_MODEL_PATH}")
+        device = _resolve_device()
+        device_label = f"GPU:0" if device == 0 else "CPU"
+        logger.info(f"[PromptInjection] Loading model: {_MODEL_PATH} on {device_label}")
+
         try:
             from transformers import pipeline as hf_pipeline
+            import torch
+
+            # Use float16 on GPU for ~2x speed + ~50% memory reduction
+            torch_dtype = torch.float16 if device == 0 else torch.float32
+
             _pipeline = hf_pipeline(
                 task="text-classification",
                 model=_MODEL_PATH,
+                device=device,
+                torch_dtype=torch_dtype,
                 return_token_type_ids=False,
                 max_length=_MAX_LENGTH,
                 truncation=True,
             )
-            logger.info("[PromptInjection] ✅ Model loaded and cached")
+            logger.info(f"[PromptInjection] ✅ Model loaded on {device_label} (dtype={torch_dtype})")
         except Exception as e:
             logger.error(f"[PromptInjection] Failed to load model: {e}")
             raise
@@ -62,6 +108,9 @@ class PromptInjection:
 
     Drop-in replacement for llm_guard.input_scanners.PromptInjection.
     Same scan() interface: returns (sanitized_prompt, is_valid, risk_score)
+
+    GPU acceleration is automatic when CUDA is available.
+    Force CPU with: INFLOW_DEVICE=cpu
 
     Usage:
         scanner = PromptInjection(threshold=0.8)
